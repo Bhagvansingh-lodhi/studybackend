@@ -1,0 +1,44 @@
+# -------------------------
+# Node / Backend Ignore
+# -------------------------
+
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-error.log
+pnpm-debug.log
+
+# Logs
+logs
+*.log
+*.log.*
+debug.log
+
+# Build / temp files
+dist/
+build/
+.cache/
+.tmp/
+temp/
+
+# Environment files (VERY IMPORTANT)
+.env
+.env.local
+.env.*.local
+
+# OS/system files
+.DS_Store
+Thumbs.db
+
+# IDE / editor configs
+.vscode/
+.idea/
+*.swp
+
+# TypeScript (if used)
+*.tsbuildinfo
+
+# Coverage reports (if running tests)
+coverage/
+*.lcov
+
