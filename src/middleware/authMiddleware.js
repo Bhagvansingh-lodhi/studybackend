@@ -1,9 +1,9 @@
 import jwt from "jsonwebtoken";
 import { config } from "../config/env.js";
-import { User } from "../models/User.js";
 
-export const authMiddleware = async (req, res, next) => {
+export const authMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
+
   if (!authHeader?.startsWith("Bearer ")) {
     return res.status(401).json({ message: "No token provided" });
   }
@@ -12,14 +12,13 @@ export const authMiddleware = async (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, config.jwtSecret);
-    const user = await User.findById(decoded.userId).select("-passwordHash");
-    if (!user) {
-      return res.status(401).json({ message: "User not found" });
-    }
-    req.user = user;
-    next();
+
+    // 🚀 No DB call (FAST)
+    req.user = decoded; // { userId, email, name }
+
+    return next();
+
   } catch (err) {
-    console.error("Auth error:", err.message);
     return res.status(401).json({ message: "Invalid token" });
   }
 };

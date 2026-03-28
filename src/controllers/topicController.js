@@ -1,6 +1,7 @@
 import { TopicPack } from "../models/TopicPack.js";
 import { generateStudyPack } from "../services/aiService.js";
 
+/* ---------- Utils ---------- */
 function computeCompletion(topic) {
   const totalModules = topic.modules?.length || 0;
   const completedModules = topic.progress?.completedModules?.length || 0;
@@ -8,12 +9,13 @@ function computeCompletion(topic) {
   return Math.round((completedModules / totalModules) * 100);
 }
 
-// GET /api/topics
+/* ---------- GET ALL TOPICS ---------- */
 export const getTopics = async (req, res, next) => {
   try {
-    const topics = await TopicPack.find({ userId: req.user._id }).sort({
-      createdAt: -1
-    });
+    const topics = await TopicPack.find({ userId: req.user.userId })
+      .select("title difficulty createdAt modules flashcards mcqs progress")
+      .sort({ createdAt: -1 })
+      .lean();
 
     const mapped = topics.map((t) => ({
       id: t._id,
@@ -22,136 +24,168 @@ export const getTopics = async (req, res, next) => {
       createdAt: t.createdAt,
       completion: computeCompletion(t),
       stats: {
-        modules: t.modules.length,
-        flashcards: t.flashcards.length,
-        mcqs: t.mcqs.length,
+        modules: t.modules?.length || 0,
+        flashcards: t.flashcards?.length || 0,
+        mcqs: t.mcqs?.length || 0,
         lastQuizScore:
           t.progress?.quizzes?.[t.progress.quizzes.length - 1]?.score || null
       }
     }));
 
-    res.json(mapped);
+    return res.json(mapped);
   } catch (err) {
     next(err);
   }
 };
 
-// POST /api/topics/generate
+/* ---------- GENERATE TOPIC (NON-BLOCKING AI) ---------- */
 export const generateTopic = async (req, res, next) => {
   try {
     const { topicName, difficulty = "Medium" } = req.body;
+
     if (!topicName)
       return res.status(400).json({ message: "topicName is required" });
 
-    const aiResult = await generateStudyPack(topicName, difficulty);
+    // ✅ Check cache (avoid AI call if already exists)
+    const existing = await TopicPack.findOne({
+      userId: req.user.userId,
+      title: topicName,
+      difficulty
+    }).lean();
 
-    // basic validation
-    if (!aiResult.title || !Array.isArray(aiResult.modules)) {
-      return res.status(500).json({ message: "AI response malformed" });
+    if (existing) {
+      return res.json(existing);
     }
 
+    // 🚀 Step 1: Create placeholder topic instantly
     const topic = await TopicPack.create({
-      userId: req.user._id,
-      title: aiResult.title || topicName,
+      userId: req.user.userId,
+      title: topicName,
       difficulty,
-      overview: aiResult.overview || "",
-      modules: aiResult.modules || [],
-      flashcards:
-        (aiResult.flashcards || []).map((f) => ({
-          question: f.question,
-          answer: f.answer,
-          level: f.level || "medium"
-        })) || [],
-      mcqs: aiResult.mcqs || [],
-      subjectiveQuestions: aiResult.subjectiveQuestions || [],
-      revisionPlan:
-        (aiResult.revisionPlan || []).map((d) => ({
-          dayIndex: d.dayIndex,
-          tasks: d.tasks || [],
-          completed: d.completed || false
-        })) || []
+      status: "processing",
+      modules: [],
+      flashcards: [],
+      mcqs: [],
+      subjectiveQuestions: [],
+      revisionPlan: [],
+      progress: {
+        completedModules: [],
+        flashcardsStats: [],
+        quizzes: [],
+        revisionPlan: []
+      }
     });
 
-    res.status(201).json(topic);
+    // ⚡ Step 2: Respond immediately
+    res.status(202).json({
+      message: "Topic generation started",
+      topicId: topic._id
+    });
+
+    // 🔥 Step 3: Background AI processing
+    (async () => {
+      try {
+        const aiResult = await generateStudyPack(topicName, difficulty);
+
+        await TopicPack.findByIdAndUpdate(topic._id, {
+          title: aiResult.title || topicName,
+          overview: aiResult.overview || "",
+          modules: aiResult.modules || [],
+          flashcards: (aiResult.flashcards || []).map((f) => ({
+            question: f.question,
+            answer: f.answer,
+            level: f.level || "medium"
+          })),
+          mcqs: aiResult.mcqs || [],
+          subjectiveQuestions: aiResult.subjectiveQuestions || [],
+          revisionPlan: aiResult.revisionPlan || [],
+          status: "ready",
+          progress: {
+            completedModules: [],
+            flashcardsStats: [],
+            quizzes: [],
+            revisionPlan: (aiResult.revisionPlan || []).map((d) => ({
+              dayIndex: d.dayIndex,
+              completed: false
+            }))
+          }
+        });
+      } catch (err) {
+        await TopicPack.findByIdAndUpdate(topic._id, {
+          status: "failed"
+        });
+      }
+    })();
+
   } catch (err) {
     next(err);
   }
 };
 
-// GET /api/topics/:id
+/* ---------- GET SINGLE TOPIC ---------- */
 export const getTopicById = async (req, res, next) => {
   try {
     const topic = await TopicPack.findOne({
       _id: req.params.id,
-      userId: req.user._id
-    });
+      userId: req.user.userId
+    }).lean();
 
-    if (!topic) return res.status(404).json({ message: "Topic not found" });
+    if (!topic)
+      return res.status(404).json({ message: "Topic not found" });
 
-    res.json(topic);
+    return res.json(topic);
   } catch (err) {
     next(err);
   }
 };
 
-// PATCH /api/topics/:id/progress
+/* ---------- UPDATE PROGRESS ---------- */
 export const updateProgress = async (req, res, next) => {
   try {
-    const { completedModules, flashcardsStats, revisionPlan } = req.body;
+    const updates = req.body;
 
     const topic = await TopicPack.findOne({
       _id: req.params.id,
-      userId: req.user._id
+      userId: req.user.userId
     });
 
-    if (!topic) return res.status(404).json({ message: "Topic not found" });
+    if (!topic)
+      return res.status(404).json({ message: "Topic not found" });
 
-    // merge completedModules (indices)
-    if (Array.isArray(completedModules)) {
-      const set = new Set([
-        ...(topic.progress?.completedModules || []),
-        ...completedModules
-      ]);
-      topic.progress.completedModules = Array.from(set).sort((a, b) => a - b);
-    }
+    const updatedProgress = {
+      completedModules:
+        updates.completedModules ?? topic.progress.completedModules,
+      flashcardsStats:
+        updates.flashcardsStats ?? topic.progress.flashcardsStats,
+      revisionPlan:
+        updates.revisionPlan ?? topic.progress.revisionPlan,
+      quizzes: topic.progress.quizzes
+    };
 
-    // append flashcardsStats
-    if (Array.isArray(flashcardsStats)) {
-      topic.progress.flashcardsStats = [
-        ...(topic.progress.flashcardsStats || []),
-        ...flashcardsStats
-      ];
-    }
+    await TopicPack.findByIdAndUpdate(req.params.id, {
+      $set: { progress: updatedProgress }
+    });
 
-    // update revisionPlan completion (by dayIndex)
-    if (Array.isArray(revisionPlan)) {
-      revisionPlan.forEach((updateDay) => {
-        const idx = topic.revisionPlan.findIndex(
-          (d) => d.dayIndex === updateDay.dayIndex
-        );
-        if (idx !== -1 && typeof updateDay.completed === "boolean") {
-          topic.revisionPlan[idx].completed = updateDay.completed;
-        }
-      });
-    }
-
-    await topic.save();
-    res.json(topic.progress);
+    return res.json(updatedProgress);
   } catch (err) {
     next(err);
   }
 };
 
-// POST /api/topics/:id/quiz
+/* ---------- QUIZ ---------- */
 export const takeQuiz = async (req, res, next) => {
   try {
-    const { answers } = req.body; // array of selected indices
+    const { answers } = req.body;
+
     const topic = await TopicPack.findOne({
       _id: req.params.id,
-      userId: req.user._id
-    });
+      userId: req.user.userId
+    })
+      .select("mcqs progress")
+      .lean();
 
-    if (!topic) return res.status(404).json({ message: "Topic not found" });
+    if (!topic)
+      return res.status(404).json({ message: "Topic not found" });
 
     if (!Array.isArray(answers) || answers.length !== topic.mcqs.length) {
       return res
@@ -160,10 +194,12 @@ export const takeQuiz = async (req, res, next) => {
     }
 
     let correct = 0;
+
     const details = topic.mcqs.map((q, i) => {
       const userAnswer = answers[i];
       const isCorrect = userAnswer === q.correctIndex;
       if (isCorrect) correct++;
+
       return {
         question: q.question,
         options: q.options,
@@ -176,10 +212,18 @@ export const takeQuiz = async (req, res, next) => {
 
     const score = Math.round((correct / topic.mcqs.length) * 100);
 
-    topic.progress.quizzes.push({ score });
-    await topic.save();
+    // ⚡ push quiz without loading full doc
+    await TopicPack.findByIdAndUpdate(req.params.id, {
+      $push: { "progress.quizzes": { score } }
+    });
 
-    res.json({ score, total: topic.mcqs.length, correct, details });
+    return res.json({
+      score,
+      total: topic.mcqs.length,
+      correct,
+      details
+    });
+
   } catch (err) {
     next(err);
   }
